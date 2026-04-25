@@ -1,5 +1,6 @@
 import cv2
 import time
+from collections import deque
 from ollama import AsyncClient
 from pydantic import BaseModel
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +30,13 @@ class Chaplin:
         self.fps = 16
         self.frame_interval = 1 / self.fps
         self.frame_compression = 25
+
+        # streaming params: while recording, flush a chunk every `chunk_seconds`
+        # and seed the next chunk with `overlap_frames` carried over so words
+        # straddling chunk boundaries still have context.
+        self.chunk_seconds = 2.0
+        self.chunk_frames = int(self.fps * self.chunk_seconds)
+        self.overlap_frames = 5
 
         # setup keyboard controller for typing
         self.kbd_controller = keyboard.Controller()
@@ -122,17 +130,12 @@ class Chaplin:
         # print the raw output to console
         print(f"\n\033[48;5;21m\033[97m\033[1m RAW OUTPUT \033[0m: {output}\n")
 
-        # assign sequence number for this task
-        sequence_num = self.current_sequence
-        self.current_sequence += 1
+        # type raw output immediately. single-worker executor serializes
+        # perform_inference calls, so chunks are typed in capture order.
+        text = (output or "").strip()
+        if text:
+            self.kbd_controller.type(text + " ")
 
-        # start the async LLM correction (non-blocking) with sequence number
-        asyncio.run_coroutine_threadsafe(
-            self.correct_output_async(output, sequence_num),
-            self.loop
-        )
-
-        # return immediately without waiting for correction
         return {
             "output": output,
             "video_path": video_path
@@ -154,6 +157,32 @@ class Chaplin:
         output_path = ""
         out = None
         frame_count = 0
+        # rolling buffer of the most recent frames written, used to seed the
+        # next chunk with overlap so words crossing chunk boundaries survive.
+        overlap_buffer = deque(maxlen=self.overlap_frames)
+
+        def _new_writer():
+            path = self.output_prefix + str(time.time_ns() // 1_000_000) + '.mp4'
+            writer = cv2.VideoWriter(
+                path,
+                cv2.VideoWriter_fourcc(*'mp4v'),
+                self.fps,
+                (frame_width, frame_height),
+                False,  # isColor
+            )
+            return path, writer
+
+        def _flush_chunk(writer, path, count):
+            """Close `writer` and submit `path` for inference if long enough."""
+            if writer is not None:
+                writer.release()
+            if count >= self.fps * 2:
+                futures.append(self.executor.submit(self.perform_inference, path))
+            elif path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
         while True:
             key = cv2.waitKey(1) & 0xFF
@@ -179,17 +208,14 @@ class Chaplin:
 
                     if self.recording:
                         if out is None:
-                            output_path = self.output_prefix + \
-                                str(time.time_ns() // 1_000_000) + '.mp4'
-                            out = cv2.VideoWriter(
-                                output_path,
-                                cv2.VideoWriter_fourcc(*'mp4v'),
-                                self.fps,
-                                (frame_width, frame_height),
-                                False  # isColor
-                            )
+                            output_path, out = _new_writer()
+                            # seed with overlap from previous chunk (if any)
+                            for f in overlap_buffer:
+                                out.write(f)
+                                frame_count += 1
 
                         out.write(compressed_frame)
+                        overlap_buffer.append(compressed_frame)
 
                         last_frame_time = current_time
 
@@ -198,29 +224,22 @@ class Chaplin:
                                                       20, 20), 10, (0, 0, 0), -1)
 
                         frame_count += 1
-                    # check if not recording AND video is at least 2 seconds long
+
+                        # mid-recording flush: emit a chunk every chunk_frames
+                        # of fresh content so transcription streams out instead
+                        # of waiting for the user to toggle recording off.
+                        if frame_count >= self.chunk_frames:
+                            _flush_chunk(out, output_path, frame_count)
+                            output_path, out = _new_writer()
+                            for f in overlap_buffer:
+                                out.write(f)
+                            frame_count = len(overlap_buffer)
+                    # recording just stopped — flush the tail
                     elif not self.recording and frame_count > 0:
-                        if out is not None:
-                            out.release()
-
-                        # only run inference if the video is at least 2 seconds long
-                        if frame_count >= self.fps * 2:
-                            futures.append(self.executor.submit(
-                                self.perform_inference, output_path))
-                        else:
-                            os.remove(output_path)
-
-                        output_path = self.output_prefix + \
-                            str(time.time_ns() // 1_000_000) + '.mp4'
-                        out = cv2.VideoWriter(
-                            output_path,
-                            cv2.VideoWriter_fourcc(*'mp4v'),
-                            self.fps,
-                            (frame_width, frame_height),
-                            False  # isColor
-                        )
-
+                        _flush_chunk(out, output_path, frame_count)
+                        output_path, out = "", None
                         frame_count = 0
+                        overlap_buffer.clear()
 
                     # display the frame in the window
                     cv2.imshow('Chaplin', cv2.flip(compressed_frame, 1))
