@@ -5,9 +5,9 @@ scikit-image >= 0.13.0
 av >= 10.0.0
 six >= 1.16.0 
 mediapipe
-torch
-torchvision
-torchaudio
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
 ollama
 pydantic
 pynput
