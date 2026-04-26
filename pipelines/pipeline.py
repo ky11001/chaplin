@@ -71,3 +71,8 @@ class InferencePipeline(torch.nn.Module):
         data = self.dataloader.load_data(data_filename, landmarks)
         transcript = self.model.infer(data)
         return transcript
+
+
+    def infer_arrays(self, video, landmarks):
+        data = self.dataloader.load_video_array(video, landmarks)
+        return self.model.infer(data)

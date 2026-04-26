@@ -52,6 +52,13 @@ class AVSRDataLoader:
             return video, audio
 
 
+    def load_video_array(self, video, landmarks):
+        assert self.modality == "video", "load_video_array supports video modality only"
+        video = self.video_process(video, landmarks)
+        video = torch.tensor(video)
+        return self.video_transform(video) if self.transform else video
+
+
     def load_audio(self, data_filename):
         waveform, sample_rate = torchaudio.load(data_filename, normalize=True)
         return waveform, sample_rate

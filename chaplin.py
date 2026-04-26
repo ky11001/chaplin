@@ -1,10 +1,10 @@
 import cv2
 import time
+import numpy as np
 from collections import deque
 from ollama import AsyncClient
 from pydantic import BaseModel
 from concurrent.futures import ThreadPoolExecutor
-import os
 from pynput import keyboard
 import asyncio
 
@@ -25,11 +25,9 @@ class Chaplin:
         self.executor = ThreadPoolExecutor(max_workers=1)
 
         # video params
-        self.output_prefix = "webcam"
         self.res_factor = 3
         self.fps = 16
         self.frame_interval = 1 / self.fps
-        self.frame_compression = 25
 
         # streaming params: while recording, flush a chunk every `chunk_seconds`
         # and seed the next chunk with `overlap_frames` carried over so words
@@ -123,23 +121,31 @@ class Chaplin:
 
         return chat_output.corrected_text
 
-    def perform_inference(self, video_path):
-        # perform inference on the video with the vsr model
-        output = self.vsr_model(video_path)
+    def _detect_landmarks(self, rgb_frame):
+        """Run mediapipe on a single RGB frame; fall back to short-range."""
+        det = self.vsr_model.landmarks_detector
+        lm = det.detect([rgb_frame], det.full_range_detector)[0]
+        if lm is None:
+            lm = det.detect([rgb_frame], det.short_range_detector)[0]
+        return lm
 
-        # print the raw output to console
+    def perform_inference(self, frames, landmarks):
+        # bail if mediapipe never locked on during this chunk — the downstream
+        # interpolator asserts at least one valid frame.
+        if not any(lm is not None for lm in landmarks):
+            print("\n\033[48;5;208m\033[97m\033[1m SKIPPED \033[0m: no face detected in chunk\n")
+            return {"output": ""}
+
+        video = np.stack(frames, axis=0)
+        output = self.vsr_model.infer_arrays(video, landmarks)
+
         print(f"\n\033[48;5;21m\033[97m\033[1m RAW OUTPUT \033[0m: {output}\n")
 
-        # type raw output immediately. single-worker executor serializes
-        # perform_inference calls, so chunks are typed in capture order.
         text = (output or "").strip()
         if text:
             self.kbd_controller.type(text + " ")
 
-        return {
-            "output": output,
-            "video_path": video_path
-        }
+        return {"output": output}
 
     def start_webcam(self):
         # init webcam
@@ -149,115 +155,86 @@ class Chaplin:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640 // self.res_factor)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480 // self.res_factor)
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         last_frame_time = time.time()
 
         futures = []
-        output_path = ""
-        out = None
-        frame_count = 0
-        # rolling buffer of the most recent frames written, used to seed the
-        # next chunk with overlap so words crossing chunk boundaries survive.
-        overlap_buffer = deque(maxlen=self.overlap_frames)
+        # in-memory buffers; no disk round-trip.
+        chunk_frames = []
+        chunk_landmarks = []
+        # rolling tail used to seed the next chunk with overlap so words
+        # crossing chunk boundaries survive.
+        overlap_frames = deque(maxlen=self.overlap_frames)
+        overlap_landmarks = deque(maxlen=self.overlap_frames)
 
-        def _new_writer():
-            path = self.output_prefix + str(time.time_ns() // 1_000_000) + '.mp4'
-            writer = cv2.VideoWriter(
-                path,
-                cv2.VideoWriter_fourcc(*'mp4v'),
-                self.fps,
-                (frame_width, frame_height),
-                False,  # isColor
-            )
-            return path, writer
-
-        def _flush_chunk(writer, path, count):
-            """Close `writer` and submit `path` for inference if long enough."""
-            if writer is not None:
-                writer.release()
-            if count >= self.fps * 2:
-                futures.append(self.executor.submit(self.perform_inference, path))
-            elif path:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+        def _flush_chunk():
+            """Submit the current chunk if it has at least 2s of content."""
+            if len(chunk_frames) >= self.fps * 2:
+                futures.append(self.executor.submit(
+                    self.perform_inference, list(chunk_frames), list(chunk_landmarks)))
 
         while True:
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
-                # remove any remaining videos that were saved to disk
-                for file in os.listdir():
-                    if file.startswith(self.output_prefix) and file.endswith('.mp4'):
-                        os.remove(file)
                 break
 
             current_time = time.time()
+            if current_time - last_frame_time < self.frame_interval:
+                continue
 
-            # conditional ensures that the video is recorded at the correct frame rate
-            if current_time - last_frame_time >= self.frame_interval:
-                ret, frame = cap.read()
-                if ret:
-                    # frame compression
-                    encode_param = [
-                        int(cv2.IMWRITE_JPEG_QUALITY), self.frame_compression]
-                    _, buffer = cv2.imencode('.jpg', frame, encode_param)
-                    compressed_frame = cv2.imdecode(
-                        buffer, cv2.IMREAD_GRAYSCALE)
+            ret, frame = cap.read()
+            if not ret:
+                continue
 
-                    if self.recording:
-                        if out is None:
-                            output_path, out = _new_writer()
-                            # seed with overlap from previous chunk (if any)
-                            for f in overlap_buffer:
-                                out.write(f)
-                                frame_count += 1
+            # capture is BGR; mediapipe + the model preprocessing both expect RGB.
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                        out.write(compressed_frame)
-                        overlap_buffer.append(compressed_frame)
+            if self.recording:
+                # seed a fresh chunk with the previous chunk's overlap tail.
+                if not chunk_frames and overlap_frames:
+                    chunk_frames.extend(overlap_frames)
+                    chunk_landmarks.extend(overlap_landmarks)
 
-                        last_frame_time = current_time
+                lm = self._detect_landmarks(rgb_frame)
+                chunk_frames.append(rgb_frame)
+                chunk_landmarks.append(lm)
+                overlap_frames.append(rgb_frame)
+                overlap_landmarks.append(lm)
 
-                        # circle to indicate recording, only appears in the window and is not present in video saved to disk
-                        cv2.circle(compressed_frame, (frame_width -
-                                                      20, 20), 10, (0, 0, 0), -1)
+                last_frame_time = current_time
 
-                        frame_count += 1
+                # mid-recording flush so transcription streams.
+                if len(chunk_frames) >= self.chunk_frames:
+                    _flush_chunk()
+                    chunk_frames.clear()
+                    chunk_landmarks.clear()
 
-                        # mid-recording flush: emit a chunk every chunk_frames
-                        # of fresh content so transcription streams out instead
-                        # of waiting for the user to toggle recording off.
-                        if frame_count >= self.chunk_frames:
-                            _flush_chunk(out, output_path, frame_count)
-                            output_path, out = _new_writer()
-                            for f in overlap_buffer:
-                                out.write(f)
-                            frame_count = len(overlap_buffer)
-                    # recording just stopped — flush the tail
-                    elif not self.recording and frame_count > 0:
-                        _flush_chunk(out, output_path, frame_count)
-                        output_path, out = "", None
-                        frame_count = 0
-                        overlap_buffer.clear()
+                # display: BGR copy with record indicator.
+                display = frame.copy()
+                cv2.circle(display, (frame_width - 20, 20), 10, (0, 0, 255), -1)
+            elif chunk_frames:
+                # recording just stopped — flush the tail and reset.
+                _flush_chunk()
+                chunk_frames.clear()
+                chunk_landmarks.clear()
+                overlap_frames.clear()
+                overlap_landmarks.clear()
+                display = frame
+            else:
+                display = frame
 
-                    # display the frame in the window
-                    cv2.imshow('Chaplin', cv2.flip(compressed_frame, 1))
+            cv2.imshow('Chaplin', cv2.flip(display, 1))
 
-            # ensures that videos are handled in the order they were recorded
+            # ensure outputs are consumed in capture order.
             for fut in futures:
                 if fut.done():
-                    result = fut.result()
-                    # once done processing, delete the video with the video path
-                    os.remove(result["video_path"])
+                    fut.result()
                     futures.remove(fut)
                 else:
                     break
 
         # release everything
         cap.release()
-        if out:
-            out.release()
         cv2.destroyAllWindows()
 
         # stop global hotkey listener
