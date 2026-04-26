@@ -12,9 +12,20 @@ import cv2
 import numpy as np
 
 
+def _get_face_detection_module():
+    if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_detection"):
+        return mp.solutions.face_detection
+    version = getattr(mp, "__version__", "unknown")
+    raise ImportError(
+        "Incompatible mediapipe installation detected "
+        f"(version={version}). This detector requires the legacy "
+        "`mediapipe.solutions.face_detection` API. Install `mediapipe==0.10.14`."
+    )
+
+
 class LandmarksDetector:
     def __init__(self):
-        self.mp_face_detection = mp.solutions.face_detection
+        self.mp_face_detection = _get_face_detection_module()
         self.short_range_detector = self.mp_face_detection.FaceDetection(min_detection_confidence=0.5, model_selection=0)
         self.full_range_detector = self.mp_face_detection.FaceDetection(min_detection_confidence=0.5, model_selection=1)
 
